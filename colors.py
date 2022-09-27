@@ -18,7 +18,7 @@ from keras import layers
 # data
 dataset_name = "imagenette"
 dataset_repetitions = 1
-num_epochs = 5  # train for at least 50 epochs for good results
+num_epochs = 50  # train for at least 50 epochs for good results
 image_size = 320
 plot_diffusion_steps = 20
 
@@ -29,7 +29,7 @@ max_signal_rate = 0.95
 # architecture
 embedding_dims = 32
 embedding_max_frequency = 1000.0
-widths = [32, 64, 96, 128]
+widths = [4, 4, 6, 8]
 block_depth = 2
 
 # optimization
@@ -72,8 +72,8 @@ def prepare_dataset(split):
 
 
 # load dataset
-train_dataset = prepare_dataset("train[:1000]")
-val_dataset = prepare_dataset("validation[:10]")
+train_dataset = prepare_dataset("train")
+val_dataset = prepare_dataset("validation[:100]")
 
 def sinusoidal_embedding(x):
     embedding_min_frequency = 1.0
@@ -160,9 +160,15 @@ class DiffusionModel(keras.Model):
     def __init__(self, image_size, widths, block_depth, plot_dataset):
         super().__init__()
 
+        self.normalizer = layers.Normalization()
         self.network = get_network(image_size, widths, block_depth)
         self.ema_network = keras.models.clone_model(self.network)
         self.plot_dataset = plot_dataset
+
+    def denormalize(self, images):
+        # convert the pixel values back to 0-1 range
+        images = self.normalizer.mean + images * self.normalizer.variance**0.5
+        return tf.clip_by_value(images, 0.0, 1.0)
 
     def compile(self, **kwargs):
         super().compile(**kwargs)
@@ -243,11 +249,16 @@ class DiffusionModel(keras.Model):
 
     def generate(self, num_images, images, diffusion_steps):
 
+        images = self.normalizer(images, training=False)
+
         initial_noise = tf.random.normal(shape=(num_images, image_size, image_size, 2))
         noiseh, noises = tf.split(initial_noise, num_or_size_splits=2, axis=-1)
         _, _, v = tf.split(images, num_or_size_splits=3, axis=-1)
         noisy_images = tf.concat([noiseh, noises, v], axis=-1)
         generated_images = self.reverse_diffusion(noisy_images, diffusion_steps)
+
+        generated_images = self.denormalize(generated_images)
+
         generated_images = tfio.experimental.color.hsv_to_rgb(generated_images)
         return generated_images
 
@@ -271,6 +282,7 @@ class DiffusionModel(keras.Model):
         return noisy_images
 
     def train_step(self, images):
+        images = self.normalizer(images, training=True)
         noises = tf.random.normal(shape=(batch_size, image_size, image_size, 2))
 
         # sample uniform random diffusion times
@@ -304,6 +316,7 @@ class DiffusionModel(keras.Model):
         return {m.name: m.result() for m in self.metrics[:-1]}
 
     def test_step(self, images):
+        images = self.normalizer(images, training=False)
         noises = tf.random.normal(shape=(batch_size, image_size, image_size, 2))
 
         # sample uniform random diffusion times
@@ -328,8 +341,8 @@ class DiffusionModel(keras.Model):
 
     def plot_images(self, epoch=None, logs=None, num_rows=2, num_cols=4):
         # plot random generated images for visual evaluation of generation quality
-        images = self.plot_dataset.take(num_rows * num_cols).unbatch()
-        images = tf.stack(list(map(lambda x: x, images)))
+        images = list(self.plot_dataset.unbatch().take(num_rows * num_cols))
+        images = tf.stack(images)
         generated_images = self.generate(
             num_images=num_rows * num_cols,
             images = images,
