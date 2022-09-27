@@ -1,71 +1,3 @@
-"""
-Title: Denoising Diffusion Implicit Models
-Author: [András Béres](https://www.linkedin.com/in/andras-beres-789190210)
-Date created: 2022/06/24
-Last modified: 2022/06/24
-Description: Generating images of flowers with denoising diffusion implicit models.
-"""
-
-"""
-## Introduction
-
-### What are diffusion models?
-
-Recently, [denoising diffusion models](https://arxiv.org/abs/2006.11239), including
-[score-based generative models](https://arxiv.org/abs/1907.05600), gained popularity as a
-powerful class of generative models, that can [rival](https://arxiv.org/abs/2105.05233)
-even [generative adversarial networks (GANs)](https://arxiv.org/abs/1406.2661) in image
-synthesis quality. They tend to generate more diverse samples, while being stable to
-train and easy to scale. Recent large diffusion models, such as
-[DALL-E 2](https://openai.com/dall-e-2/) and [Imagen](https://imagen.research.google/),
-have shown incredible text-to-image generation capability. One of their drawbacks is
-however, that they are slower to sample from, because they require multiple forward passes
-for generating an image.
-
-Diffusion refers to the process of turning a structured signal (an image) into noise
-step-by-step. By simulating diffusion, we can generate noisy images from our training
-images, and can train a neural network to try to denoise them. Using the trained network
-we can simulate the opposite of diffusion, reverse diffusion, which is the process of an
-image emerging from noise.
-
-![diffusion process gif](https://i.imgur.com/dipPOfa.gif)
-
-One-sentence summary: **diffusion models are trained to denoise noisy images, and can
-generate images by iteratively denoising pure noise.**
-
-### Goal of this example
-
-This code example intends to be a minimal but feature-complete (with a generation quality
-metric) implementation of diffusion models, with modest compute requirements and
-reasonable performance. My implementation choices and hyperparameter tuning were done
-with these goals in mind.
-
-Since currently the literature of diffusion models is
-[mathematically quite complex](https://arxiv.org/abs/2206.00364)
-with multiple theoretical frameworks
-([score matching](https://arxiv.org/abs/1907.05600),
-[differential equations](https://arxiv.org/abs/2011.13456),
-[Markov chains](https://arxiv.org/abs/2006.11239)) and sometimes even
-[conflicting notations (see Appendix C.2)](https://arxiv.org/abs/2010.02502),
-it can be daunting trying to understand
-them. My view of these models in this example will be that they learn to separate a
-noisy image into its image and Gaussian noise components.
-
-In this example I made effort to break down all long mathematical expressions into
-digestible pieces and gave all variables explanatory names. I also included numerous
-links to relevant literature to help interested readers dive deeper into the topic, in
-the hope that this code example will become a good starting point for practitioners
-learning about diffusion models.
-
-In the following sections, we will implement a continous time version of
-[Denoising Diffusion Implicit Models (DDIMs)](https://arxiv.org/abs/2010.02502)
-with deterministic sampling.
-"""
-
-"""
-## Setup
-"""
-
 import math
 import matplotlib.pyplot as plt
 import tensorflow as tf
@@ -104,21 +36,6 @@ ema = 0.999
 learning_rate = 1e-3
 weight_decay = 1e-4
 
-"""
-## Data pipeline
-
-We will use the
-[Oxford Flowers 102](https://www.tensorflow.org/datasets/catalog/oxford_flowers102)
-dataset for
-generating images of flowers, which is a diverse natural dataset containing around 8,000
-images. Unfortunately the official splits are imbalanced, as most of the images are
-contained in the test split. We create new splits (80% train, 20% validation) using the
-[Tensorflow Datasets slicing API](https://www.tensorflow.org/datasets/splits). We apply
-center crops as preprocessing, and repeat the dataset multiple times (reason given in the
-next section).
-"""
-
-
 def preprocess_image(data):
     # center crop image
     height = tf.shape(data["image"])[0]
@@ -139,8 +56,6 @@ def preprocess_image(data):
 
 
 def prepare_dataset(split):
-    # the validation dataset is shuffled as well, because data order matters
-    # for the KID estimation
     return (
         tfds.load(dataset_name, split=split, shuffle_files=True)
         .map(preprocess_image, num_parallel_calls=tf.data.AUTOTUNE)
@@ -241,57 +156,6 @@ class KID(keras.metrics.Metric):
         self.kid_tracker.reset_state()
 
 
-"""
-## Network architecture
-
-Here we specify the architecture of the neural network that we will use for denoising. We
-build a [U-Net](https://arxiv.org/abs/1505.04597) with identical input and output
-dimensions. U-Net is a popular semantic segmentation architecture, whose main idea is
-that it progressively downsamples and then upsamples its input image, and adds skip
-connections between layers having the same resolution. These help with gradient flow and
-avoid introducing a representation bottleneck, unlike usual
-[autoencoders](https://www.deeplearningbook.org/contents/autoencoders.html). Based on
-this, one can view
-[diffusion models as denoising autoencoders](https://benanne.github.io/2022/01/31/diffusion.html)
-without a bottleneck.
-
-The network takes two inputs, the noisy images and the variances of their noise
-components. The latter is required since denoising a signal requires different operations
-at different levels of noise. We transform the noise variances using sinusoidal
-embeddings, similarly to positional encodings used both in
-[transformers](https://arxiv.org/abs/1706.03762) and
-[NeRF](https://arxiv.org/abs/2003.08934). This helps the network to be
-[highly sensitive](https://arxiv.org/abs/2006.10739) to the noise level, which is
-crucial for good performance. We implement sinusoidal embeddings using a
-[Lambda layer](https://keras.io/api/layers/core_layers/lambda/).
-
-Some other considerations:
-
-* We build the network using the
-[Keras Functional API](https://keras.io/guides/functional_api/), and use
-[closures](https://twitter.com/fchollet/status/1441927912836321280) to build blocks of
-layers in a consistent style.
-* [Diffusion models](https://arxiv.org/abs/2006.11239) embed the index of the timestep of
-the diffusion process instead of the noise variance, while
-[score-based models (Table 1)](https://arxiv.org/abs/2206.00364)
-usually use some function of the noise level. I
-prefer the latter so that we can change the sampling schedule at inference time, without
-retraining the network.
-* [Diffusion models](https://arxiv.org/abs/2006.11239) input the embedding to each
-convolution block separately. We only input it at the start of the network for
-simplicity, which in my experience barely decreases preformance, because the skip and
-residual connections help the information propagate through the network properly.
-* In the literature it is common to use
-[attention layers](https://keras.io/api/layers/attention_layers/multi_head_attention/)
-at lower resolutions for better global coherence. I omitted it for simplicity.
-* We disable the learnable center and scale parameters of the batch normalization layers,
-since the following convolution layers make them redundant.
-* We initialize the last convolution's kernel to all zeros as a good practice, making the
-network predict only zeros after initialization, which is the mean of its targets. This
-will improve behaviour at the start of training and make the mean squared error loss
-start at exactly 1.
-"""
-
 
 def sinusoidal_embedding(x):
     embedding_min_frequency = 1.0
@@ -374,89 +238,6 @@ def get_network(image_size, widths, block_depth):
     x = layers.Conv2D(3, kernel_size=1, kernel_initializer="zeros")(x)
 
     return keras.Model([noisy_images, noise_variances], x, name="residual_unet")
-
-
-"""
-This showcases the power of the Functional API. Note how we built a relatively complex
-U-Net with skip connections, residual blocks, multiple inputs, and sinusoidal embeddings
-in 80 lines of code!
-"""
-
-"""
-## Diffusion model
-
-### Diffusion schedule
-
-Let us say, that a diffusion process starts at time = 0, and ends at time = 1. This
-variable will be called diffusion time, and can be either discrete (common in diffusion
-models) or continuous (common in score-based models). I choose the latter, so that the
-number of sampling steps can be changed at inference time.
-
-We need to have a function that tells us at each point in the diffusion process the noise
-levels and signal levels of the noisy image corresponding to the actual diffusion time.
-This will be called the diffusion schedule (see `diffusion_schedule()`).
-
-This schedule outputs two quantities: the `noise_rate` and the `signal_rate`
-(corresponding to sqrt(1 - alpha) and sqrt(alpha) in the DDIM paper, respectively). We
-generate the noisy image by weighting the random noise and the training image by their
-corresponding rates and adding them together.
-
-Since the (standard normal) random noises and the (normalized) images both have zero mean
-and unit variance, the noise rate and signal rate can be interpreted as the standard
-deviation of their components in the noisy image, while the squares of their rates can be
-interpreted as their variance (or their power in the signal processing sense). The rates
-will always be set so that their squared sum is 1, meaning that the noisy images will
-always have unit variance, just like its unscaled components.
-
-We will use a simplified, continuous version of the
-[cosine schedule (Section 3.2)](https://arxiv.org/abs/2102.09672),
-that is quite commonly used in the literature.
-This schedule is symmetric, slow towards the start and end of the diffusion process, and
-it also has a nice geometric interpretation, using the
-[trigonometric properties of the unit circle](https://en.wikipedia.org/wiki/Unit_circle#/media/File:Circle-trig6.svg):
-
-![diffusion schedule gif](https://i.imgur.com/JW9W0fA.gif)
-
-### Training process
-
-The training procedure (see `train_step()` and `denoise()`) of denoising diffusion models
-is the following: we sample random diffusion times uniformly, and mix the training images
-with random gaussian noises at rates corresponding to the diffusion times. Then, we train
-the model to separate the noisy image to its two components.
-
-Usually, the neural network is trained to predict the unscaled noise component, from
-which the predicted image component can be calculated using the signal and noise rates.
-Pixelwise
-[mean squared error](https://keras.io/api/losses/regression_losses/#mean_squared_error-function) should
-be used theoretically, however I recommend using
-[mean absolute error](https://keras.io/api/losses/regression_losses/#mean_absolute_error-function)
-instead (similarly to
-[this](https://github.com/lucidrains/denoising-diffusion-pytorch/blob/master/denoising_diffusion_pytorch/denoising_diffusion_pytorch.py#L371)
-implementation), which produces better results on this dataset.
-
-### Sampling (reverse diffusion)
-
-When sampling (see `reverse_diffusion()`), at each step we take the previous estimate of
-the noisy image and separate it into image and noise using our network. Then we recombine
-these components using the signal and noise rate of the following step.
-
-Though a similar view is shown in
-[Equation 12 of DDIMs](https://arxiv.org/abs/2010.02502), I believe the above explanation
-of the sampling equation is not widely known.
-
-This example only implements the deterministic sampling procedure from DDIM, which
-corresponds to *eta = 0* in the paper. One can also use stochastic sampling (in which
-case the model becomes a
-[Denoising Diffusion Probabilistic Model (DDPM)](https://arxiv.org/abs/2006.11239)),
-where a part of the predicted noise is
-replaced with the same or larger amount of random noise
-([see Equation 16 and below](https://arxiv.org/abs/2010.02502)).
-
-Stochastic sampling can be used without retraining the network (since both models are
-trained the same way), and it can improve sample quality, while on the other hand
-requiring more sampling steps usually.
-"""
-
 
 class DiffusionModel(keras.Model):
     def __init__(self, image_size, widths, block_depth):
