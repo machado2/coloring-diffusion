@@ -1,23 +1,25 @@
+import random
 import math
 import matplotlib.pyplot as plt
 import tensorflow as tf
 import tensorflow_datasets as tfds
+import tensorflow_io as tfio
 
 from tensorflow import keras
 from keras import layers
+
+#tf.config.run_functions_eagerly(True)
+#tf.data.experimental.enable_debug_mode()
 
 """
 ## Hyperparameterers
 """
 
 # data
-dataset_name = "oxford_flowers102"
-dataset_repetitions = 5
-num_epochs = 1  # train for at least 50 epochs for good results
-image_size = 64
-# KID = Kernel Inception Distance, see related section
-kid_image_size = 75
-kid_diffusion_steps = 5
+dataset_name = "imagenette"
+dataset_repetitions = 1
+num_epochs = 5  # train for at least 50 epochs for good results
+image_size = 320
 plot_diffusion_steps = 20
 
 # sampling
@@ -31,9 +33,9 @@ widths = [32, 64, 96, 128]
 block_depth = 2
 
 # optimization
-batch_size = 64
+batch_size = 1
 ema = 0.999
-learning_rate = 1e-3
+learning_rate = 1e-4
 weight_decay = 1e-4
 
 def preprocess_image(data):
@@ -52,7 +54,9 @@ def preprocess_image(data):
     # resize and clip
     # for image downsampling it is important to turn on antialiasing
     image = tf.image.resize(image, size=[image_size, image_size], antialias=True)
-    return tf.clip_by_value(image / 255.0, 0.0, 1.0)
+    image = tf.clip_by_value(image / 255.0, 0.0, 1.0)
+    image = tfio.experimental.color.rgb_to_hsv(image)
+    return image
 
 
 def prepare_dataset(split):
@@ -68,94 +72,8 @@ def prepare_dataset(split):
 
 
 # load dataset
-train_dataset = prepare_dataset("train[:80%]+validation[:80%]+test[:80%]")
-val_dataset = prepare_dataset("train[80%:]+validation[80%:]+test[80%:]")
-
-"""
-## Kernel inception distance
-
-[Kernel Inception Distance (KID)](https://arxiv.org/abs/1801.01401) is an image quality
-metric which was proposed as a replacement for the popular
-[Frechet Inception Distance (FID)](https://arxiv.org/abs/1706.08500).
-I prefer KID to FID because it is simpler to
-implement, can be estimated per-batch, and is computationally lighter. More details
-[here](https://keras.io/examples/generative/gan_ada/#kernel-inception-distance).
-
-In this example, the images are evaluated at the minimal possible resolution of the
-Inception network (75x75 instead of 299x299), and the metric is only measured on the
-validation set for computational efficiency. We also limit the number of sampling steps
-at evaluation to 5 for the same reason.
-
-Since the dataset is relatively small, we go over the train and validation splits
-multiple times per epoch, because the KID estimation is noisy and compute-intensive, so
-we want to evaluate only after many iterations, but for many iterations.
-
-"""
-
-
-class KID(keras.metrics.Metric):
-    def __init__(self, name, **kwargs):
-        super().__init__(name=name, **kwargs)
-
-        # KID is estimated per batch and is averaged across batches
-        self.kid_tracker = keras.metrics.Mean(name="kid_tracker")
-
-        # a pretrained InceptionV3 is used without its classification layer
-        # transform the pixel values to the 0-255 range, then use the same
-        # preprocessing as during pretraining
-        self.encoder = keras.Sequential(
-            [
-                keras.Input(shape=(image_size, image_size, 3)),
-                layers.Rescaling(255.0),
-                layers.Resizing(height=kid_image_size, width=kid_image_size),
-                layers.Lambda(keras.applications.inception_v3.preprocess_input),
-                keras.applications.InceptionV3(
-                    include_top=False,
-                    input_shape=(kid_image_size, kid_image_size, 3),
-                    weights="imagenet",
-                ),
-                layers.GlobalAveragePooling2D(),
-            ],
-            name="inception_encoder",
-        )
-
-    def polynomial_kernel(self, features_1, features_2):
-        feature_dimensions = tf.cast(tf.shape(features_1)[1], dtype=tf.float32)
-        return (features_1 @ tf.transpose(features_2) / feature_dimensions + 1.0) ** 3.0
-
-    def update_state(self, real_images, generated_images, sample_weight=None):
-        real_features = self.encoder(real_images, training=False)
-        generated_features = self.encoder(generated_images, training=False)
-
-        # compute polynomial kernels using the two sets of features
-        kernel_real = self.polynomial_kernel(real_features, real_features)
-        kernel_generated = self.polynomial_kernel(
-            generated_features, generated_features
-        )
-        kernel_cross = self.polynomial_kernel(real_features, generated_features)
-
-        # estimate the squared maximum mean discrepancy using the average kernel values
-        batch_size = tf.shape(real_features)[0]
-        batch_size_f = tf.cast(batch_size, dtype=tf.float32)
-        mean_kernel_real = tf.reduce_sum(kernel_real * (1.0 - tf.eye(batch_size))) / (
-            batch_size_f * (batch_size_f - 1.0)
-        )
-        mean_kernel_generated = tf.reduce_sum(
-            kernel_generated * (1.0 - tf.eye(batch_size))
-        ) / (batch_size_f * (batch_size_f - 1.0))
-        mean_kernel_cross = tf.reduce_mean(kernel_cross)
-        kid = mean_kernel_real + mean_kernel_generated - 2.0 * mean_kernel_cross
-
-        # update the average KID estimate
-        self.kid_tracker.update_state(kid)
-
-    def result(self):
-        return self.kid_tracker.result()
-
-    def reset_state(self):
-        self.kid_tracker.reset_state()
-
-
+train_dataset = prepare_dataset("train[:1000]")
+val_dataset = prepare_dataset("validation[:10]")
 
 def sinusoidal_embedding(x):
     embedding_min_frequency = 1.0
@@ -235,33 +153,26 @@ def get_network(image_size, widths, block_depth):
     for width in reversed(widths[:-1]):
         x = UpBlock(width, block_depth)([x, skips])
 
-    x = layers.Conv2D(3, kernel_size=1, kernel_initializer="zeros")(x)
-
+    x = layers.Conv2D(2, kernel_size=1, kernel_initializer="zeros")(x)
     return keras.Model([noisy_images, noise_variances], x, name="residual_unet")
 
 class DiffusionModel(keras.Model):
-    def __init__(self, image_size, widths, block_depth):
+    def __init__(self, image_size, widths, block_depth, plot_dataset):
         super().__init__()
 
-        self.normalizer = layers.Normalization()
         self.network = get_network(image_size, widths, block_depth)
         self.ema_network = keras.models.clone_model(self.network)
+        self.plot_dataset = plot_dataset
 
     def compile(self, **kwargs):
         super().compile(**kwargs)
 
         self.noise_loss_tracker = keras.metrics.Mean(name="n_loss")
         self.image_loss_tracker = keras.metrics.Mean(name="i_loss")
-        self.kid = KID(name="kid")
 
     @property
     def metrics(self):
-        return [self.noise_loss_tracker, self.image_loss_tracker, self.kid]
-
-    def denormalize(self, images):
-        # convert the pixel values back to 0-1 range
-        images = self.normalizer.mean + images * self.normalizer.variance**0.5
-        return tf.clip_by_value(images, 0.0, 1.0)
+        return [self.noise_loss_tracker, self.image_loss_tracker]
 
     def diffusion_schedule(self, diffusion_times):
         # diffusion times -> angles
@@ -286,14 +197,20 @@ class DiffusionModel(keras.Model):
 
         # predict noise component and calculate the image component using it
         pred_noises = network([noisy_images, noise_rates**2], training=training)
-        pred_images = (noisy_images - noise_rates * pred_noises) / signal_rates
 
+        imgh, imgs, imgv = tf.split(noisy_images, num_or_size_splits=3, axis=-1)
+        pred_noise_h, pred_noise_s = tf.split(pred_noises, num_or_size_splits=2, axis=-1)
+        pred_image_h = (imgh - noise_rates * pred_noise_h) / signal_rates
+        pred_image_s = (imgs - noise_rates * pred_noise_s) / signal_rates
+        pred_images = tf.concat([pred_image_h, pred_image_s, imgv], axis=-1)
         return pred_noises, pred_images
 
     def reverse_diffusion(self, initial_noise, diffusion_steps):
         # reverse diffusion = sampling
         num_images = initial_noise.shape[0]
         step_size = 1.0 / diffusion_steps
+
+        _, _, v = tf.split(initial_noise, num_or_size_splits=3, axis=-1)
 
         # important line:
         # at the first sampling step, the "noisy image" is pure noise
@@ -315,24 +232,46 @@ class DiffusionModel(keras.Model):
             next_noise_rates, next_signal_rates = self.diffusion_schedule(
                 next_diffusion_times
             )
-            next_noisy_images = (
-                next_signal_rates * pred_images + next_noise_rates * pred_noises
-            )
-            # this new noisy image will be used in the next step
-
+            
+            predh, preds, _ = tf.split(pred_images, 3, -1)
+            noiseh, noises = tf.split(pred_noises, 2, -1)
+            
+            nexth = (next_signal_rates * predh + next_noise_rates * noiseh)
+            nexts = (next_signal_rates * preds + next_noise_rates * noises)
+            next_noisy_images = tf.concat([nexth, nexts, v], -1)
         return pred_images
 
-    def generate(self, num_images, diffusion_steps):
-        # noise -> images -> denormalized images
-        initial_noise = tf.random.normal(shape=(num_images, image_size, image_size, 3))
-        generated_images = self.reverse_diffusion(initial_noise, diffusion_steps)
-        generated_images = self.denormalize(generated_images)
+    def generate(self, num_images, images, diffusion_steps):
+
+        initial_noise = tf.random.normal(shape=(num_images, image_size, image_size, 2))
+        noiseh, noises = tf.split(initial_noise, num_or_size_splits=2, axis=-1)
+        _, _, v = tf.split(images, num_or_size_splits=3, axis=-1)
+        noisy_images = tf.concat([noiseh, noises, v], axis=-1)
+        generated_images = self.reverse_diffusion(noisy_images, diffusion_steps)
+        generated_images = tfio.experimental.color.hsv_to_rgb(generated_images)
         return generated_images
 
+        initial_noise = tf.random.normal(shape=(num_images, image_size, image_size, 2))
+        noiseh, noises = tf.split(initial_noise, num_or_size_splits=2, axis=-1)
+        _, _, v = tf.split(images, num_or_size_splits=3, axis=-1)
+        noisy_images = tf.concat([noiseh, noises, v], axis=-1)
+        generated_images = self.reverse_diffusion(noisy_images, diffusion_steps)
+        generated_images = list(map(lambda img: tfio.experimental.color.hsv_to_rgb(img), generated_images))
+        return generated_images
+        generated_images = images
+        generated_images = tfio.experimental.color.hsv_to_rgb(generated_images)
+        return generated_images
+
+    def create_noisy_images(self, images, noise_rates, signal_rates, noises):
+        noiseh, noises = tf.split(noises, num_or_size_splits=2, axis=-1)
+        h, s, v = tf.split(images, num_or_size_splits=3, axis=-1)
+        noisy_h = signal_rates * h + noise_rates * noiseh
+        noisy_s = signal_rates * s + noise_rates * noises
+        noisy_images = tf.concat([noisy_h, noisy_s, v], axis=-1)
+        return noisy_images
+
     def train_step(self, images):
-        # normalize images to have standard deviation of 1, like the noises
-        images = self.normalizer(images, training=True)
-        noises = tf.random.normal(shape=(batch_size, image_size, image_size, 3))
+        noises = tf.random.normal(shape=(batch_size, image_size, image_size, 2))
 
         # sample uniform random diffusion times
         diffusion_times = tf.random.uniform(
@@ -340,7 +279,7 @@ class DiffusionModel(keras.Model):
         )
         noise_rates, signal_rates = self.diffusion_schedule(diffusion_times)
         # mix the images with noises accordingly
-        noisy_images = signal_rates * images + noise_rates * noises
+        noisy_images = self.create_noisy_images(images, noise_rates, signal_rates, noises)
 
         with tf.GradientTape() as tape:
             # train the network to separate noisy images to their components
@@ -352,6 +291,7 @@ class DiffusionModel(keras.Model):
             image_loss = self.loss(images, pred_images)  # only used as metric
 
         gradients = tape.gradient(noise_loss, self.network.trainable_weights)
+        #gradients = tape.gradient(image_loss, self.network.trainable_weights)
         self.optimizer.apply_gradients(zip(gradients, self.network.trainable_weights))
 
         self.noise_loss_tracker.update_state(noise_loss)
@@ -361,13 +301,10 @@ class DiffusionModel(keras.Model):
         for weight, ema_weight in zip(self.network.weights, self.ema_network.weights):
             ema_weight.assign(ema * ema_weight + (1 - ema) * weight)
 
-        # KID is not measured during the training phase for computational efficiency
         return {m.name: m.result() for m in self.metrics[:-1]}
 
     def test_step(self, images):
-        # normalize images to have standard deviation of 1, like the noises
-        images = self.normalizer(images, training=False)
-        noises = tf.random.normal(shape=(batch_size, image_size, image_size, 3))
+        noises = tf.random.normal(shape=(batch_size, image_size, image_size, 2))
 
         # sample uniform random diffusion times
         diffusion_times = tf.random.uniform(
@@ -375,7 +312,7 @@ class DiffusionModel(keras.Model):
         )
         noise_rates, signal_rates = self.diffusion_schedule(diffusion_times)
         # mix the images with noises accordingly
-        noisy_images = signal_rates * images + noise_rates * noises
+        noisy_images = self.create_noisy_images(images, noise_rates, signal_rates, noises)
 
         # use the network to separate noisy images to their components
         pred_noises, pred_images = self.denoise(
@@ -387,21 +324,15 @@ class DiffusionModel(keras.Model):
 
         self.image_loss_tracker.update_state(image_loss)
         self.noise_loss_tracker.update_state(noise_loss)
-
-        # measure KID between real and generated images
-        # this is computationally demanding, kid_diffusion_steps has to be small
-        images = self.denormalize(images)
-        generated_images = self.generate(
-            num_images=batch_size, diffusion_steps=kid_diffusion_steps
-        )
-        self.kid.update_state(images, generated_images)
-
         return {m.name: m.result() for m in self.metrics}
 
-    def plot_images(self, epoch=None, logs=None, num_rows=3, num_cols=6):
+    def plot_images(self, epoch=None, logs=None, num_rows=2, num_cols=4):
         # plot random generated images for visual evaluation of generation quality
+        images = self.plot_dataset.take(num_rows * num_cols).unbatch()
+        images = tf.stack(list(map(lambda x: x, images)))
         generated_images = self.generate(
             num_images=num_rows * num_cols,
+            images = images,
             diffusion_steps=plot_diffusion_steps,
         )
 
@@ -422,7 +353,7 @@ class DiffusionModel(keras.Model):
 """
 
 # create and compile the model
-model = DiffusionModel(image_size, widths, block_depth)
+model = DiffusionModel(image_size, widths, block_depth, val_dataset)
 # below tensorflow 2.9:
 # pip install tensorflow_addons
 # import tensorflow_addons as tfa
@@ -435,18 +366,19 @@ model.compile(
 )
 # pixelwise mean absolute error is used as loss
 
-# save the best model based on the validation KID metric
-checkpoint_path = "checkpoints/diffusion_model"
+checkpoint_path = "checkpoints/color_model"
 checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
     filepath=checkpoint_path,
     save_weights_only=True,
-    monitor="val_kid",
     mode="min",
-    save_best_only=True,
 )
 
-# calculate mean and variance of training dataset for normalization
-model.normalizer.adapt(train_dataset)
+try:
+    model.load_weights(checkpoint_path)
+except:
+    pass
+
+model.plot_images()
 
 # run training and plot generated images periodically
 model.fit(
